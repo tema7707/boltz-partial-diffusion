@@ -2058,7 +2058,9 @@ def process_chain_feature_constraints(data: Tokenized) -> dict[str, Tensor]:
 
 
 def process_contact_feature_constraints(
-    data, inference_pocket_constraints, inference_contact_constraints
+    data: Tokenized,
+    inference_pocket_constraints: list[tuple[int, list[tuple[int, int]], float]],
+    inference_contact_constraints: list[tuple[tuple[int, int], tuple[int, int], float]],
 ):
     token_data = data.tokens
     union_idx = 0
@@ -2333,7 +2335,9 @@ class Boltz2Featurizer:
             residue_constraint_features = process_residue_constraint_features(data)
             chain_constraint_features = process_chain_feature_constraints(data)
             contact_constraint_features = process_contact_feature_constraints(
-                data, inference_pocket_constraints, inference_contact_constraints
+                data=data,
+                inference_pocket_constraints=inference_pocket_constraints if inference_pocket_constraints else [],
+                inference_contact_constraints=inference_contact_constraints if inference_contact_constraints else [],
             )
 
         features = {
