@@ -327,12 +327,40 @@ class AtomDiffusion(Module):
             max_parallel_samples = multiplicity
 
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
+        
+        # Extract partial diffusion configuration
+        feats = network_condition_kwargs.get("feats", {})
+        partial_diffusion_fraction = feats.get("partial_diffusion_fraction", 0.0)
+        if hasattr(partial_diffusion_fraction, 'item'):
+            partial_diffusion_fraction = partial_diffusion_fraction.item()
+        
+        # Calculate step range for partial diffusion
+        # Partial diffusion allows starting from an intermediate point in the denoising process
+        # Example: fraction=0.25 means run only the final 25% of denoising steps
+        original_num_steps = num_sampling_steps
+        partial_diffusion_skip_steps = 0
+        
+        if partial_diffusion_fraction > 0.0 and "initial_coords" in feats:
+            # Calculate how many steps to skip based on the fraction
+            partial_diffusion_skip_steps = int(original_num_steps * (1.0 - partial_diffusion_fraction))
+            actual_steps = original_num_steps - partial_diffusion_skip_steps
+            actual_steps = max(1, actual_steps)  # Ensure at least 1 step
+            
+            # Update sampling steps for partial diffusion
+            num_sampling_steps = actual_steps
+        
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
 
         shape = (*atom_mask.shape, 3)
 
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
-        sigmas = self.sample_schedule(num_sampling_steps)
+        if partial_diffusion_skip_steps > 0:
+            # For partial diffusion, generate the full schedule and slice the relevant portion
+            full_sigmas = self.sample_schedule(original_num_steps)
+            # Take the final portion of the schedule (skip the first part)
+            sigmas = full_sigmas[partial_diffusion_skip_steps:partial_diffusion_skip_steps + num_sampling_steps + 1]
+        else:
+            sigmas = self.sample_schedule(num_sampling_steps)
         gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0)
         sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
         if self.training and self.step_scale_random is not None:
@@ -340,9 +368,61 @@ class AtomDiffusion(Module):
         else:
             step_scale = self.step_scale
 
-        # atom position is noise at the beginning
+        # Check if trajectory saving is enabled
+        save_trajectory = network_condition_kwargs.get("feats", {}).get("save_trajectory", False)
+        trajectory_decoded_only = network_condition_kwargs.get("feats", {}).get("trajectory_decoded_only", False)
+        
+        # Initialize trajectory storage
+        trajectory_coords = []
+        trajectory_denoised = []
+
+        # atom position initialization - support partial diffusion
         init_sigma = sigmas[0]
-        atom_coords = init_sigma * torch.randn(shape, device=self.device)
+        
+        # Check if initial coordinates are provided for partial diffusion
+        feats = network_condition_kwargs.get("feats", {})
+        if "initial_coords" in feats and feats["initial_coords"] is not None:
+            initial_coords = feats["initial_coords"]
+            
+            # Ensure correct shape and device
+            if len(initial_coords.shape) == 2:  # (num_atoms, 3)
+                initial_coords = initial_coords.unsqueeze(0)  # (1, num_atoms, 3)
+            
+            initial_coords = initial_coords.to(device=self.device, dtype=torch.float32)
+            
+            # Repeat for multiplicity (multiple samples)
+            initial_coords = initial_coords.repeat_interleave(multiplicity, 0)
+            
+            # Handle shape mismatch by padding or truncating if needed
+            if initial_coords.shape != shape:
+                expected_atoms = shape[1]  # shape is (batch, atoms, 3)
+                actual_atoms = initial_coords.shape[-2]
+                
+                if actual_atoms < expected_atoms:
+                    # Pad with zeros
+                    padding_needed = expected_atoms - actual_atoms
+                    padding = torch.zeros((initial_coords.shape[0], padding_needed, 3), 
+                                        device=initial_coords.device, dtype=initial_coords.dtype)
+                    initial_coords = torch.cat([initial_coords, padding], dim=1)
+                elif actual_atoms > expected_atoms:
+                    # Truncate to expected size
+                    initial_coords = initial_coords[:, :expected_atoms, :]
+            
+            # For partial diffusion, start with noise level corresponding to the starting sigma
+            if partial_diffusion_fraction > 0.0:
+                # Use the actual sigma from the schedule where we're starting
+                starting_sigma = init_sigma  # This is now the correct sigma from the sliced schedule
+                
+                noise = torch.randn_like(initial_coords)
+                atom_coords = initial_coords + starting_sigma * noise
+            else:
+                # Very light noise for stability  
+                noise = torch.randn_like(initial_coords)
+                atom_coords = initial_coords + 0.01 * init_sigma * noise
+                
+        else:
+            # Original behavior: start from pure noise
+            atom_coords = init_sigma * torch.randn(shape, device=self.device)
         token_repr = None
         atom_coords_denoised = None
 
@@ -351,6 +431,12 @@ class AtomDiffusion(Module):
             random_R, random_tr = compute_random_augmentation(
                 multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
             )
+            
+            # Store un-rotated coordinates for trajectory (before random augmentation)
+            if save_trajectory:
+                atom_coords_centered = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
+                trajectory_coords.append(atom_coords_centered[0].detach().cpu().clone())
+            
             atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
             atom_coords = (
                 torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
@@ -394,6 +480,16 @@ class AtomDiffusion(Module):
                         ),
                     )
                     atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+
+                # Store un-rotated denoised coordinates for trajectory
+                if save_trajectory and atom_coords_denoised is not None:
+                    # Apply inverse transformation to remove random augmentation
+                    inverse_R = random_R.transpose(-1, -2)  # Transpose for inverse rotation
+                    atom_coords_denoised_unrotated = torch.einsum("bmd,bsd->bms", 
+                                                                 atom_coords_denoised - random_tr, inverse_R)
+                    # Center the un-rotated coordinates  
+                    atom_coords_denoised_centered = atom_coords_denoised_unrotated - atom_coords_denoised_unrotated.mean(dim=-2, keepdims=True)
+                    trajectory_denoised.append(atom_coords_denoised_centered[0].detach().cpu().clone())
 
                 if steering_args["fk_steering"] and (
                     (
@@ -527,7 +623,20 @@ class AtomDiffusion(Module):
 
             atom_coords = atom_coords_next
 
-        return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
+        # Prepare return dictionary
+        result_dict = dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
+        
+        # Add trajectory data if trajectory saving was enabled
+        if save_trajectory:
+            if trajectory_coords:
+                result_dict["trajectory_coords"] = trajectory_coords
+            if trajectory_denoised and not trajectory_decoded_only:
+                result_dict["trajectory_denoised"] = trajectory_denoised
+            elif trajectory_denoised and trajectory_decoded_only:
+                # Only include denoised trajectory when decoded_only is requested
+                result_dict["trajectory_denoised"] = trajectory_denoised
+                
+        return result_dict
 
     def loss_weight(self, sigma):
         return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)

@@ -140,6 +140,8 @@ def collate(data: list[dict[str, Tensor]]) -> dict[str, Tensor]:
             "ligand_symmetries",
             "record",
             "affinity_mw",
+            "save_trajectory",
+            "fixed_chains",
         ]:
             # Check if all have the same shape
             shape = values[0].shape
@@ -428,6 +430,8 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
                 "ligand_symmetries",
                 "record",
                 "affinity_mw",
+                "save_trajectory",
+                "fixed_chains",
             ]:
                 batch[key] = batch[key].to(device)
         return batch

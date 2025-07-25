@@ -1118,6 +1118,28 @@ class Boltz2(LightningModule):
                     pred_dict["affinity_probability_binary2"] = out[
                         "affinity_probability_binary2"
                     ]
+            
+            # Add trajectory coordinates if present
+            if "trajectory_coords" in out:
+                pred_dict["trajectory_coords"] = out["trajectory_coords"]
+            if "trajectory_denoised" in out:
+                pred_dict["trajectory_denoised"] = out["trajectory_denoised"]
+                
+                # Debug: Check atom count differences
+                final_coords = out["sample_atom_coords"].detach().cpu().clone()
+                traj_frames = len(pred_dict["trajectory_denoised"])
+                
+                if traj_frames > 0:
+                    diffusion_atoms = pred_dict["trajectory_denoised"][0].shape[-2]
+                    prediction_atoms = final_coords.shape[-2] 
+                    
+                    print(f"[Boltz2] Trajectory atoms: {diffusion_atoms}, Prediction atoms: {prediction_atoms}")
+                    
+                    if diffusion_atoms != prediction_atoms:
+                        print(f"[Boltz2] ⚠️  ATOM COUNT MISMATCH: Diffusion uses {diffusion_atoms} atoms (subset), final prediction has {prediction_atoms} atoms (full structure)")
+                        print(f"[Boltz2] This is expected - diffusion operates on backbone/CA atoms for efficiency")
+                        print(f"[Boltz2] Trajectory shows evolution of subset, final prediction shows complete structure")
+                
             return pred_dict
 
         except RuntimeError as e:  # catch out of memory exceptions

@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 from typing import Optional
 from collections import deque
 import numba
@@ -2335,7 +2336,7 @@ class Boltz2Featurizer:
                 data, inference_pocket_constraints, inference_contact_constraints
             )
 
-        return {
+        features = {
             **token_features,
             **atom_features,
             **msa_features,
@@ -2348,3 +2349,27 @@ class Boltz2Featurizer:
             **contact_constraint_features,
             **ligand_to_mw,
         }
+        
+        # Check for trajectory saving configuration and fixed chains
+        initial_coords_file = Path.cwd() / "initial_coords.pt"
+        if initial_coords_file.exists():
+            coords_data = torch.load(initial_coords_file)
+            if isinstance(coords_data, dict):
+                # Extract configuration
+                save_trajectory = coords_data.get('save_trajectory', False)
+                fixed_chains = coords_data.get('fixed_chains', [])
+                
+                if save_trajectory:
+                    features["save_trajectory"] = save_trajectory
+                    
+                if fixed_chains:
+                    features["fixed_chains"] = fixed_chains
+                    
+                # Load initial coordinates and partial diffusion settings
+                initial_coords = coords_data.get('coords')
+                if initial_coords is not None:
+                    features["initial_coords"] = initial_coords
+                    partial_diffusion_fraction = coords_data.get('partial_diffusion_fraction', 0.0)
+                    features["partial_diffusion_fraction"] = torch.tensor(partial_diffusion_fraction, dtype=torch.float32)
+
+        return features
