@@ -81,8 +81,7 @@ class BoltzWriter(BasePredictionWriter):
         else:
             idx_to_rank = {i: i for i in range(len(records))}
 
-        # Process and save structures first, then handle trajectory saving with final coordinates
-        final_coords_for_trajectory = {}  # Store final coordinates for trajectory
+        final_coords_for_trajectory = {}
 
         # Iterate over the records
         for record, coord, pad_mask in zip(records, coords, pad_masks):
@@ -126,7 +125,7 @@ class BoltzWriter(BasePredictionWriter):
                     coord_unpad = [(x,) for x in coord_unpad]
                     coord_unpad = np.array(coord_unpad, dtype=Coords)
 
-                # Mew residue table
+                # New residue table
                 residues = structure.residues
                 residues["is_present"] = True
 
@@ -271,7 +270,6 @@ class BoltzWriter(BasePredictionWriter):
                 )
                 np.savez_compressed(path, s=s, z=z)
         
-        # Handle trajectory saving AFTER all structures are processed with final coordinates
         try:
             if "trajectory_coords" in prediction or "trajectory_denoised" in prediction:
                 self._save_trajectories_with_final_coords(prediction, batch, records, coords, pad_masks, final_coords_for_trajectory)
@@ -297,38 +295,19 @@ class BoltzWriter(BasePredictionWriter):
         pad_masks: Tensor,
         final_coords_for_trajectory: dict[str, dict[str, any]]
     ) -> None:
-        """Save trajectory data using final processed coordinates to ensure consistency.
-        
-        Parameters
-        ----------
-        prediction : dict
-            Prediction outputs containing trajectory data
-        batch : dict
-            Batch data with configuration
-        records : list[Record]
-            List of record objects
-        coords : Tensor
-            Final coordinates tensor
-        pad_masks : Tensor
-            Padding masks for coordinates
-        final_coords_for_trajectory : dict
-            Dictionary mapping record IDs to final coordinate data
-        """
-        trajectory_coords = prediction.get("trajectory_coords", [])  # Raw noisy coordinates
-        trajectory_denoised = prediction.get("trajectory_denoised", [])  # Decoded predictions
+        """Save trajectory data using final processed coordinates."""
+        trajectory_coords = prediction.get("trajectory_coords", [])
+        trajectory_denoised = prediction.get("trajectory_denoised", [])
 
-        # Save trajectory for each record in the batch (usually just one)
         for i, (record, coord, pad_mask) in enumerate(zip(records, coords, pad_masks)):
             trajectory_writer = TrajectoryWriter(self.output_dir, record.id)
             
-            # Get the final coordinates that were actually written to the output files
             final_data = final_coords_for_trajectory.get(record.id)
             if not final_data:
                 continue
                 
-            final_coords = final_data['coords']  # These are the exact coordinates written to CIF
+            final_coords = final_data['coords']
             
-            # Extract trajectory for this batch item
             def extract_batch_trajectory(traj_list, final_coords_numpy):
                 import torch
                 batch_traj = []
@@ -400,7 +379,29 @@ class BoltzWriter(BasePredictionWriter):
             fixed_chains = []
             if "fixed_chains" in batch:
                 fixed_chains_value = batch["fixed_chains"]
-                if isinstance(fixed_chains_value, list):
+                if isinstance(fixed_chains_value, (torch.Tensor, np.ndarray)):
+                    # Handle tensor case - convert asym_ids back to chain letters
+                    fixed_asym_ids = fixed_chains_value.cpu().numpy() if hasattr(fixed_chains_value, 'cpu') else fixed_chains_value
+                    if hasattr(fixed_asym_ids, 'flatten'):
+                        fixed_asym_ids = fixed_asym_ids.flatten()
+                    
+                    # Convert asym_ids back to chain letters using structure info
+                    asym_id_to_chain = {}
+                    if record.structure and hasattr(record.structure, 'chains'):
+                        for chain in record.structure.chains:
+                            if 'asym_id' in chain and 'name' in chain:
+                                asym_id_to_chain[chain['asym_id']] = chain['name']
+                    
+                    # Map asym_ids to chain letters
+                    for asym_id in fixed_asym_ids:
+                        if asym_id in asym_id_to_chain:
+                            fixed_chains.append(asym_id_to_chain[asym_id])
+                        else:
+                            print(f"[Writer] Warning: Could not map asym_id {asym_id} to chain letter")
+                    
+                    print(f"[Writer] Converted fixed asym_ids {fixed_asym_ids} to chain letters {fixed_chains}")
+                    
+                elif isinstance(fixed_chains_value, list):
                     if len(fixed_chains_value) > 0:
                         if isinstance(fixed_chains_value[0], list):
                             # Handle nested list case: [[B]] -> [B]
@@ -408,9 +409,6 @@ class BoltzWriter(BasePredictionWriter):
                         else:
                             # Handle flat list case: [B] -> [B]
                             fixed_chains = fixed_chains_value
-                elif hasattr(fixed_chains_value, 'item'):
-                    # Handle tensor case
-                    fixed_chains = fixed_chains_value.item() if hasattr(fixed_chains_value.item(), '__iter__') else []
                 else:
                     fixed_chains = fixed_chains_value if hasattr(fixed_chains_value, '__iter__') else []
                     

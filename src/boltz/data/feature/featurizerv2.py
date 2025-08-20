@@ -31,67 +31,15 @@ from boltz.data.types import (
 )
 from boltz.model.modules.utils import center_random_augmentation
 
-####################################################################################################
-# HELPERS
-####################################################################################################
-
-
 def convert_atom_name(name: str) -> tuple[int, int, int, int]:
-    """Convert an atom name to a standard format.
-
-    Parameters
-    ----------
-    name : str
-        The atom name.
-
-    Returns
-    -------
-    tuple[int, int, int, int]
-        The converted atom name.
-
-    """
     name = str(name).strip()
     name = [ord(c) - 32 for c in name]
     name = name + [0] * (4 - len(name))
     return tuple(name)
 
 
-def sample_d(
-    min_d: float,
-    max_d: float,
-    n_samples: int,
-    random: np.random.Generator,
-) -> np.ndarray:
-    """Generate samples from a 1/d distribution between min_d and max_d.
-
-    Parameters
-    ----------
-    min_d : float
-        Minimum value of d
-    max_d : float
-        Maximum value of d
-    n_samples : int
-        Number of samples to generate
-    random : numpy.random.Generator
-        Random number generator
-
-    Returns
-    -------
-    numpy.ndarray
-        Array of samples drawn from the distribution
-
-    Notes
-    -----
-    The probability density function is:
-    f(d) = 1/(d * ln(max_d/min_d)) for d in [min_d, max_d]
-
-    The inverse CDF transform is:
-    d = min_d * (max_d/min_d)**u where u ~ Uniform(0,1)
-
-    """
-    # Generate n_samples uniform random numbers in [0, 1]
+def sample_d(min_d: float, max_d: float, n_samples: int, random: np.random.Generator) -> np.ndarray:
     u = random.random(n_samples)
-    # Transform u using the inverse CDF
     return min_d * (max_d / min_d) ** u
 
 
@@ -133,7 +81,7 @@ def compute_frames_nonpolymer(
         num_atoms = mask_chain_atom.sum()
         if (
             data.tokens[token_idx]["mol_type"] != const.chain_type_ids["NONPOLYMER"]
-            or num_atoms < 3  # noqa: PLR2004
+            or num_atoms < 3
         ):
             token_idx += num_tokens
             atom_idx += num_atoms
@@ -189,19 +137,6 @@ def compute_collinear_mask(v1, v2):
 
 
 def dummy_msa(residues: np.ndarray) -> MSA:
-    """Create a dummy MSA for a chain.
-
-    Parameters
-    ----------
-    residues : np.ndarray
-        The residues for the chain.
-
-    Returns
-    -------
-    MSA
-        The dummy MSA.
-
-    """
     residues = [res["res_type"] for res in residues]
     deletions = []
     sequences = [(0, -1, 0, len(residues), 0, 0)]
@@ -212,7 +147,7 @@ def dummy_msa(residues: np.ndarray) -> MSA:
     )
 
 
-def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
+def construct_paired_msa(
     data: Tokenized,
     random: np.random.Generator,
     max_seqs: int,
@@ -220,23 +155,6 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
     max_total: int = 16384,
     random_subset: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Pair the MSA data.
-
-    Parameters
-    ----------
-    data : Tokenized
-        The input data to the model.
-
-    Returns
-    -------
-    Tensor
-        The MSA data.
-    Tensor
-        The deletion data.
-    Tensor
-        Mask indicating paired sequences.
-
-    """
     # Get unique chains (ensuring monotonicity in the order)
     assert np.all(np.diff(data.tokens["asym_id"], n=1) >= 0)
     chain_ids = np.unique(data.tokens["asym_id"])
@@ -281,22 +199,10 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
                             "res_type"
                         ]
                     else:
-                        print(
-                            warning,
-                            "1",
-                            residues["res_type"],
-                            first_residues["res_type"],
-                            data.record.id,
-                        )
+                        print(warning, "1", residues["res_type"], first_residues["res_type"], data.record.id)
                         msa[chain_id] = dummy_msa(residues)
             else:
-                print(
-                    warning,
-                    "2",
-                    residues["res_type"],
-                    first_residues["res_type"],
-                    data.record.id,
-                )
+                print(warning, "2", residues["res_type"], first_residues["res_type"], data.record.id)
                 msa[chain_id] = dummy_msa(residues)
         else:
             msa[chain_id] = dummy_msa(residues)
@@ -311,8 +217,7 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
             taxon = sequence["taxonomy"]
             taxonomy_map.setdefault(taxon, []).append((chain_id, seq_idx))
 
-    # Remove taxonomies with only one sequence and sort by the
-    # number of chain_id present in each of the taxonomies
+    # Remove single-sequence taxonomies and sort by chain diversity
     taxonomy_map = {k: v for k, v in taxonomy_map.items() if len(v) > 1}
     taxonomy_map = sorted(
         taxonomy_map.items(),
@@ -320,8 +225,7 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
         reverse=True,
     )
 
-    # Keep track of the sequences available per chain, keeping the original
-    # order of the sequences in the MSA to favor the best matching sequences
+    # Track available sequences per chain
     visited = {(c, s) for c, items in taxonomy_map for s in items}
     available = {}
     for c in chain_ids:
@@ -337,15 +241,14 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
     is_paired.append({c: 1 for c in chain_ids})
     pairing.append({c: 0 for c in chain_ids})
 
-    # Then add up to 8191 paired rows
+    # Add paired rows
     for _, pairs in taxonomy_map:
-        # Group occurences by chain_id in case we have multiple
-        # sequences from the same chain and same taxonomy
+        # Group occurences by chain_id
         chain_occurences = {}
         for chain_id, seq_idx in pairs:
             chain_occurences.setdefault(chain_id, []).append(seq_idx)
 
-        # We create as many pairings as the maximum number of occurences
+        # Create pairings for maximum occurences
         max_occurences = max(len(v) for v in chain_occurences.values())
         for i in range(max_occurences):
             row_pairing = {}
@@ -353,7 +256,7 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
 
             # Add the chains present in the taxonomy
             for chain_id, seq_idxs in chain_occurences.items():
-                # Roll over the sequence index to maximize diversity
+                # Roll over sequence index
                 idx = i % len(seq_idxs)
                 seq_idx = seq_idxs[idx]
 
@@ -383,7 +286,7 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
         if len(pairing) >= max_pairs:
             break
 
-    # Now add up to 16384 unpaired rows total
+    # Add unpaired rows
     max_left = max(len(v) for v in available.values())
     for _ in range(min(max_total - len(pairing), max_left)):
         row_pairing = {}
@@ -404,14 +307,13 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
         if len(pairing) >= max_total:
             break
 
-    # Randomly sample a subset of the pairs
-    # ensuring the first row is always present
+    # Sample subset ensuring first row is preserved
     if random_subset:
         num_seqs = len(pairing)
         if num_seqs > max_seqs:
             indices = random.choice(
                 np.arange(1, num_seqs), size=max_seqs - 1, replace=False
-            )  # noqa: NPY002
+            )
             pairing = [pairing[0]] + [pairing[i] for i in indices]
             is_paired = [is_paired[0]] + [is_paired[i] for i in indices]
     else:
@@ -456,14 +358,12 @@ def prepare_msa_arrays(
     deletions: dict[tuple[int, int, int], int],
     msa: dict[int, MSA],
 ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
-    """Reshape data to play nicely with numba jit."""
     token_asym_ids_arr = np.array([t["asym_id"] for t in tokens], dtype=np.int64)
     token_res_idxs_arr = np.array([t["res_idx"] for t in tokens], dtype=np.int64)
 
     chain_ids = sorted(msa.keys())
 
-    # chain_ids are not necessarily contiguous (e.g. they might be 0, 24, 25).
-    # This allows us to look up a chain_id by it's index in the chain_ids list.
+    # Map chain_ids to indices for lookup
     chain_id_to_idx = {chain_id: i for i, chain_id in enumerate(chain_ids)}
     token_asym_ids_idx_arr = np.array(
         [chain_id_to_idx[asym_id] for asym_id in token_asym_ids_arr], dtype=np.int64
@@ -482,7 +382,6 @@ def prepare_msa_arrays(
 
     max_seq_len = max(len(msa[chain_id].sequences) for chain_id in chain_ids)
 
-    # we want res_start from sequences
     msa_sequences = np.full((len(chain_ids), max_seq_len), -1, dtype=np.int64)
     for chain_id in chain_ids:
         for i, seq in enumerate(msa[chain_id].sequences):
@@ -573,11 +472,6 @@ def _prepare_msa_arrays_inner(
     return msa_data, del_data, paired_data
 
 
-####################################################################################################
-# FEATURES
-####################################################################################################
-
-
 def select_subset_from_mask(mask, p, random: np.random.Generator) -> np.ndarray:
     num_true = np.sum(mask)
     v = random.geometric(p) + 1
@@ -595,7 +489,6 @@ def select_subset_from_mask(mask, p, random: np.random.Generator) -> np.ndarray:
 
 
 def get_range_bin(value: float, range_dict: dict[tuple[float, float], int], default=0):
-    """Get the bin of a value given a range dictionary."""
     value = float(value)
     for k, idx in range_dict.items():
         if k == "other":
@@ -606,7 +499,7 @@ def get_range_bin(value: float, range_dict: dict[tuple[float, float], int], defa
     return default
 
 
-def process_token_features(  # noqa: C901, PLR0915, PLR0912
+def process_token_features(
     data: Tokenized,
     random: np.random.Generator,
     max_tokens: Optional[int] = None,
@@ -625,21 +518,6 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
     ] = False,
     override_method: Optional[str] = None,
 ) -> dict[str, Tensor]:
-    """Get the token features.
-
-    Parameters
-    ----------
-    data : Tokenized
-        The input data to the model.
-    max_tokens : int
-        The maximum number of tokens.
-
-    Returns
-    -------
-    dict[str, Tensor]
-        The token features.
-
-    """
     # Token data
     token_data = data.tokens
     token_bonds = data.bonds
@@ -658,7 +536,6 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
     cyclic_period = from_numpy(token_data["cyclic_period"].copy())
     affinity_mask = from_numpy(token_data["affinity_mask"]).float()
 
-    ## Conditioning features ##
     method = (
         np.zeros(len(token_data))
         + const.method_types_ids[
@@ -2368,9 +2245,12 @@ class Boltz2Featurizer:
                     
                 if fixed_chains:
                     chain_name_to_asym_id = {}
-                    for asym_id, chain_data in data.structure.chains.items():
-                        chain_name = chain_data.get("name", str(asym_id))
-                        chain_name_to_asym_id[chain_name] = asym_id
+                    # Use same format as template processing - chains is a list of dictionaries
+                    for chain in data.structure.chains:
+                        chain_name_to_asym_id[chain["name"]] = chain["asym_id"]
+                    
+                    print(f"[FixedChains] Available chains: {chain_name_to_asym_id}")
+                    print(f"[FixedChains] Requested fixed_chains: {fixed_chains}")
                     
                     fixed_asym_ids = []
                     invalid_chains = []
@@ -2399,8 +2279,10 @@ class Boltz2Featurizer:
                     
                     if fixed_asym_ids:
                         unique_fixed_asym_ids = list(dict.fromkeys(fixed_asym_ids))
+                        print(f"[FixedChains] Mapped to asym_ids: {unique_fixed_asym_ids}")
                         features["fixed_chains"] = torch.tensor(unique_fixed_asym_ids, dtype=torch.long)
                     else:
+                        print(f"[FixedChains] No valid fixed_asym_ids found!")
                         features["fixed_chains"] = torch.tensor([], dtype=torch.long)
                     
                 # Load initial coordinates and partial diffusion settings
