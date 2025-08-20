@@ -414,15 +414,15 @@ class ValidationDataset(torch.utils.data.Dataset):
         try:
             input_data = load_input(record, dataset.target_dir, dataset.msa_dir)
         except Exception as e:
-            print(f"Failed to load input for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"Failed to load input for {record.id} with error {e}.")
+            raise RuntimeError(f"Failed to load input for record {record.id}: {e}") from e
 
         # Tokenize structure
         try:
             tokenized = dataset.tokenizer.tokenize(input_data)
         except Exception as e:
-            print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"Tokenizer failed on {record.id} with error {e}.")
+            raise RuntimeError(f"Tokenizer failed on record {record.id}: {e}") from e
 
         # Compute crop
         try:
@@ -434,8 +434,8 @@ class ValidationDataset(torch.utils.data.Dataset):
                     max_atoms=self.max_atoms,
                 )
         except Exception as e:
-            print(f"Cropper failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"Cropper failed on {record.id} with error {e}.")
+            raise RuntimeError(f"Cropper failed on record {record.id}: {e}") from e
 
         # Check if there are tokens
         if len(tokenized.tokens) == 0:
@@ -467,8 +467,8 @@ class ValidationDataset(torch.utils.data.Dataset):
                 compute_constraint_features=self.compute_constraint_features,
             )
         except Exception as e:
-            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"Featurizer failed on {record.id} with error {e}.")
+            raise RuntimeError(f"Featurizer failed on record {record.id}: {e}") from e
 
         return features
 

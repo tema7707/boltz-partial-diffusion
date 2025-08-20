@@ -233,9 +233,9 @@ class PredictionDataset(torch.utils.data.Dataset):
             tokenized = self.tokenizer.tokenize(input_data)
         except Exception as e:  # noqa: BLE001
             print(  # noqa: T201
-                f"Tokenizer failed on {record.id} with error {e}. Skipping."
+                f"Tokenizer failed on {record.id} with error {e}."
             )
-            return self.__getitem__(0)
+            raise RuntimeError(f"Tokenizer failed on record {record.id}: {e}") from e
 
         if self.affinity:
             try:
@@ -245,8 +245,8 @@ class PredictionDataset(torch.utils.data.Dataset):
                     max_atoms=2048,
                 )
             except Exception as e:  # noqa: BLE001
-                print(f"Cropper failed on {record.id} with error {e}. Skipping.")  # noqa: T201
-                return self.__getitem__(0)
+                print(f"Cropper failed on {record.id} with error {e}.")  # noqa: T201
+                raise RuntimeError(f"Cropper failed on record {record.id}: {e}") from e
 
         # Load conformers
         try:
@@ -257,8 +257,8 @@ class PredictionDataset(torch.utils.data.Dataset):
             mol_names = mol_names - set(molecules.keys())
             molecules.update(load_molecules(self.mol_dir, mol_names))
         except Exception as e:  # noqa: BLE001
-            print(f"Molecule loading failed for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            print(f"Molecule loading failed for {record.id} with error {e}.")
+            raise RuntimeError(f"Molecule loading failed for record {record.id}: {e}") from e
 
         # Inference specific options
         options = record.inference_options
@@ -297,8 +297,9 @@ class PredictionDataset(torch.utils.data.Dataset):
             import traceback
 
             traceback.print_exc()
-            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
-            return self.__getitem__(0)
+            print(f"Featurizer failed on {record.id} with error {e}.")  # noqa: T201
+            # Instead of infinite recursion, raise the original exception
+            raise RuntimeError(f"Featurizer failed on record {record.id}: {e}") from e
 
         # Add record
         features["record"] = record

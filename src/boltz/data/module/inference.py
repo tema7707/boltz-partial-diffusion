@@ -169,15 +169,15 @@ class PredictionDataset(torch.utils.data.Dataset):
                 self.constraints_dir,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"Failed to load input for {record.id} with error {e}. Skipping.")  # noqa: T201
-            return self.__getitem__(0)
+            print(f"Failed to load input for {record.id} with error {e}.")  # noqa: T201
+            raise RuntimeError(f"Failed to load input for record {record.id}: {e}") from e
 
         # Tokenize structure
         try:
             tokenized = self.tokenizer.tokenize(input_data)
         except Exception as e:  # noqa: BLE001
-            print(f"Tokenizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
-            return self.__getitem__(0)
+            print(f"Tokenizer failed on {record.id} with error {e}.")  # noqa: T201
+            raise RuntimeError(f"Tokenizer failed on record {record.id}: {e}") from e
 
         # Inference specific options
         options = record.inference_options
@@ -205,8 +205,8 @@ class PredictionDataset(torch.utils.data.Dataset):
                 compute_constraint_features=True,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
-            return self.__getitem__(0)
+            print(f"Featurizer failed on {record.id} with error {e}.")  # noqa: T201
+            raise RuntimeError(f"Featurizer failed on record {record.id}: {e}") from e
 
         features["record"] = record
         return features
