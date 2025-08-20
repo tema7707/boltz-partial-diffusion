@@ -426,6 +426,65 @@ class AtomDiffusion(Module):
         token_repr = None
         atom_coords_denoised = None
 
+        fixed_chains_data = None
+        if "fixed_chains" in feats and "initial_coords" in feats and len(feats["fixed_chains"]) > 0:
+            try:
+                fixed_asym_ids = feats["fixed_chains"]
+                initial_coords = feats["initial_coords"]
+                
+                if not isinstance(fixed_asym_ids, torch.Tensor):
+                    fixed_asym_ids = torch.tensor(fixed_asym_ids, dtype=torch.long, device=atom_coords.device)
+                else:
+                    fixed_asym_ids = fixed_asym_ids.to(device=atom_coords.device)
+                
+                if not isinstance(initial_coords, torch.Tensor):
+                    initial_coords = torch.tensor(initial_coords, dtype=atom_coords.dtype, device=atom_coords.device)
+                else:
+                    initial_coords = initial_coords.to(device=atom_coords.device, dtype=atom_coords.dtype)
+                
+                asym_id = feats["asym_id"]
+                if not isinstance(asym_id, torch.Tensor):
+                    asym_id = torch.tensor(asym_id, dtype=torch.long, device=atom_coords.device)
+                else:
+                    asym_id = asym_id.to(device=atom_coords.device)
+                
+                fixed_mask = torch.zeros_like(asym_id, dtype=torch.bool, device=atom_coords.device)
+                for fixed_asym_id in fixed_asym_ids:
+                    fixed_mask |= (asym_id == fixed_asym_id)
+                
+                if len(fixed_mask.shape) == 1:
+                    fixed_mask = fixed_mask.unsqueeze(0).unsqueeze(-1)
+                elif len(fixed_mask.shape) == 2:
+                    fixed_mask = fixed_mask.unsqueeze(-1)
+                
+                if len(initial_coords.shape) == 2:
+                    initial_coords = initial_coords.unsqueeze(0)
+                
+                if initial_coords.shape[0] != atom_coords.shape[0]:
+                    initial_coords = initial_coords.repeat(atom_coords.shape[0], 1, 1)
+                
+                if initial_coords.shape != atom_coords.shape:
+                    if initial_coords.shape[1] < atom_coords.shape[1]:
+                        padding_needed = atom_coords.shape[1] - initial_coords.shape[1]
+                        if initial_coords.shape[1] > 0:
+                            last_coord = initial_coords[:, -1:, :].expand(-1, padding_needed, -1)
+                            initial_coords = torch.cat([initial_coords, last_coord], dim=1)
+                        else:
+                            padding = torch.zeros((initial_coords.shape[0], padding_needed, 3), 
+                                                device=initial_coords.device, dtype=initial_coords.dtype)
+                            initial_coords = torch.cat([initial_coords, padding], dim=1)
+                    elif initial_coords.shape[1] > atom_coords.shape[1]:
+                        initial_coords = initial_coords[:, :atom_coords.shape[1], :]
+                
+                fixed_chains_data = {
+                    'fixed_mask': fixed_mask.expand(atom_coords.shape),
+                    'initial_coords': initial_coords,
+                    'total_steps': len(sigmas_and_gammas)
+                }
+                
+            except Exception:
+                fixed_chains_data = None
+
         # gradually denoise
         for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
             random_R, random_tr = compute_random_augmentation(
@@ -620,6 +679,12 @@ class AtomDiffusion(Module):
             atom_coords_next = (
                 atom_coords_noisy + step_scale * (sigma_t - t_hat) * denoised_over_sigma
             )
+
+            if fixed_chains_data is not None:
+                progress = step_idx / fixed_chains_data['total_steps']
+                reference_strength = min(0.7, progress * 0.5)
+                blended_coords = (1.0 - reference_strength) * atom_coords_next + reference_strength * fixed_chains_data['initial_coords']
+                atom_coords_next = torch.where(fixed_chains_data['fixed_mask'], blended_coords, atom_coords_next)
 
             atom_coords = atom_coords_next
 
