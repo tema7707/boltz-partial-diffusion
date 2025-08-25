@@ -553,18 +553,14 @@ class AtomDiffusion(Module):
 
                 # Apply fixed chains masking to the denoised prediction  
                 if fixed_chains_data is not None and "fixed_chains_ref_coords" in feats:
-                    # Follow the training pattern: reference_coords + sigma * noise
+                    # Use clean reference coordinates without additional noise
                     reference_coords = feats["fixed_chains_ref_coords"]
                     fixed_mask = feats["fixed_chains_mask"]
                     
-                    # Apply noise using the same pattern as training forward pass
-                    noise = torch.randn_like(reference_coords)
-                    noisy_reference = reference_coords + sigma_tm * noise
-                    
-                    # For fixed atoms, replace denoised prediction with noisy reference
+                    # For fixed atoms, replace denoised prediction with clean reference coordinates
                     atom_coords_denoised = torch.where(
                         fixed_mask, 
-                        noisy_reference, 
+                        reference_coords, 
                         atom_coords_denoised
                     )
                     
