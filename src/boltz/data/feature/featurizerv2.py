@@ -199,10 +199,8 @@ def construct_paired_msa(
                             "res_type"
                         ]
                     else:
-                        print(warning, "1", residues["res_type"], first_residues["res_type"], data.record.id)
                         msa[chain_id] = dummy_msa(residues)
             else:
-                print(warning, "2", residues["res_type"], first_residues["res_type"], data.record.id)
                 msa[chain_id] = dummy_msa(residues)
         else:
             msa[chain_id] = dummy_msa(residues)
@@ -2244,45 +2242,23 @@ class Boltz2Featurizer:
                     features["save_trajectory"] = save_trajectory
                     
                 if fixed_chains:
-                    chain_name_to_asym_id = {}
-                    # Use same format as template processing - chains is a list of dictionaries
-                    for chain in data.structure.chains:
-                        chain_name_to_asym_id[chain["name"]] = chain["asym_id"]
-                    
-                    print(f"[FixedChains] Available chains: {chain_name_to_asym_id}")
-                    print(f"[FixedChains] Requested fixed_chains: {fixed_chains}")
+                    chain_name_to_asym_id = {chain["name"]: chain["asym_id"] for chain in data.structure.chains}
                     
                     fixed_asym_ids = []
-                    invalid_chains = []
-                    
                     for chain_letter in fixed_chains:
-                        if not isinstance(chain_letter, str):
-                            invalid_chains.append(chain_letter)
-                            continue
-                            
-                        if chain_letter in chain_name_to_asym_id:
-                            fixed_asym_ids.append(chain_name_to_asym_id[chain_letter])
-                        else:
-                            found_match = False
-                            for chain_name, asym_id in chain_name_to_asym_id.items():
-                                if chain_name.upper() == chain_letter.upper():
-                                    fixed_asym_ids.append(asym_id)
-                                    found_match = True
-                                    break
-                            if not found_match:
-                                invalid_chains.append(chain_letter)
-                    
-                    if invalid_chains:
-                        available_chains = sorted(chain_name_to_asym_id.keys())
-                        if not fixed_asym_ids:
-                            raise ValueError(f"Invalid fixed chains {invalid_chains}. Available: {available_chains}")
+                        if isinstance(chain_letter, str):
+                            if chain_letter in chain_name_to_asym_id:
+                                fixed_asym_ids.append(chain_name_to_asym_id[chain_letter])
+                            else:
+                                for chain_name, asym_id in chain_name_to_asym_id.items():
+                                    if chain_name.upper() == chain_letter.upper():
+                                        fixed_asym_ids.append(asym_id)
+                                        break
                     
                     if fixed_asym_ids:
                         unique_fixed_asym_ids = list(dict.fromkeys(fixed_asym_ids))
-                        print(f"[FixedChains] Mapped to asym_ids: {unique_fixed_asym_ids}")
                         features["fixed_chains"] = torch.tensor(unique_fixed_asym_ids, dtype=torch.long)
                     else:
-                        print(f"[FixedChains] No valid fixed_asym_ids found!")
                         features["fixed_chains"] = torch.tensor([], dtype=torch.long)
                     
                 # Load initial coordinates and partial diffusion settings

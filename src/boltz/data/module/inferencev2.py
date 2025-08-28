@@ -298,7 +298,6 @@ class PredictionDataset(torch.utils.data.Dataset):
 
             traceback.print_exc()
             print(f"Featurizer failed on {record.id} with error {e}.")  # noqa: T201
-            # Instead of infinite recursion, raise the original exception
             raise RuntimeError(f"Featurizer failed on record {record.id}: {e}") from e
 
         # Add record

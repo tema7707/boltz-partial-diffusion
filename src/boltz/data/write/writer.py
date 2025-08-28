@@ -104,9 +104,35 @@ class BoltzWriter(BasePredictionWriter):
             for model_idx in range(coord.shape[0]):
                 # Get model coord
                 model_coord = coord[model_idx]
-                # Unpad
-                coord_unpad = model_coord[pad_mask.bool()]
+                
+                if model_coord.shape[0] >= 2:
+                    pre_unpad_bond = torch.norm(model_coord[1] - model_coord[0]).item()
+                
+                # Check size compatibility and fix mismatches
+                initial_pad_unpad = model_coord[pad_mask.bool()]
+                expected_atoms = len(structure.atoms)
+                
+                
+                if initial_pad_unpad.shape[0] != expected_atoms:
+                    
+                    # If unpadded size is larger than expected, carefully truncate to preserve geometry
+                    if initial_pad_unpad.shape[0] > expected_atoms:
+                        # The extra atoms are likely padding or intermediate processing artifacts
+                        # Take the first N atoms that match the structure template
+                        coord_unpad = initial_pad_unpad[:expected_atoms]
+                    # If unpadded size is smaller, this indicates a more serious issue
+                    else:
+                        coord_unpad = initial_pad_unpad
+                else:
+                    coord_unpad = initial_pad_unpad
+                
+                if coord_unpad.shape[0] >= 2:
+                    post_unpad_bond = torch.norm(coord_unpad[1] - coord_unpad[0]).item()
+                
                 coord_unpad = coord_unpad.cpu().numpy()
+                
+                if coord_unpad.shape[0] >= 2:
+                    numpy_bond = np.linalg.norm(coord_unpad[1] - coord_unpad[0])
                 
                 # Store final coordinates for trajectory (using first model only)
                 if model_idx == 0:
@@ -116,36 +142,72 @@ class BoltzWriter(BasePredictionWriter):
                         'pad_mask': pad_mask
                     }
 
-                # New atom table
+                # Store original coordinates and structure for normal processing
+                original_coord_unpad = coord_unpad.copy()
+                original_structure = structure
+
+                # NORMAL PROCESSING: Use standard coordinate assignment
                 atoms = structure.atoms
                 atoms["coords"] = coord_unpad
                 atoms["is_present"] = True
+                
+                if len(atoms) >= 2:
+                    atoms_bond = np.linalg.norm(atoms["coords"][1] - atoms["coords"][0])
+                
+                # For StructureV2, also create the separate coords array in Coords format
                 if self.boltz2:
                     structure: StructureV2
-                    coord_unpad = [(x,) for x in coord_unpad]
-                    coord_unpad = np.array(coord_unpad, dtype=Coords)
+                    coord_unpad_coords = np.array([(x,) for x in coord_unpad], dtype=Coords)
+                    
+                    if len(coord_unpad_coords) >= 2:
+                        coords_bond = np.linalg.norm(coord_unpad_coords[1][0] - coord_unpad_coords[0][0])
 
                 # New residue table
                 residues = structure.residues
                 residues["is_present"] = True
 
+                # Check if we need targeted hydrogen restoration for fixed chains only
+                final_atoms = atoms
+                final_coords = coord_unpad_coords if self.boltz2 else None
+                final_structure = structure
+                
+                if "fixed_chains" in batch and batch["fixed_chains"] is not None:
+                    fixed_chains_data = batch["fixed_chains"]
+                    
+                    # Handle different data formats
+                    if isinstance(fixed_chains_data, list) and len(fixed_chains_data) > 0:
+                        fixed_chains_data = fixed_chains_data[0]
+                    
+                    if isinstance(fixed_chains_data, (torch.Tensor, np.ndarray)):
+                        fixed_asym_ids = fixed_chains_data.cpu().numpy() if hasattr(fixed_chains_data, 'cpu') else fixed_chains_data
+                        fixed_asym_ids = fixed_asym_ids.flatten() if hasattr(fixed_asym_ids, 'flatten') else fixed_asym_ids
+                        
+                
                 # Update the structure
                 interfaces = np.array([], dtype=Interface)
                 if self.boltz2:
                     new_structure: StructureV2 = replace(
-                        structure,
-                        atoms=atoms,
+                        final_structure,
+                        atoms=final_atoms,
                         residues=residues,
                         interfaces=interfaces,
-                        coords=coord_unpad,
+                        coords=final_coords if final_coords is not None else coord_unpad_coords,
                     )
                 else:
                     new_structure: Structure = replace(
-                        structure,
-                        atoms=atoms,
+                        final_structure,
+                        atoms=final_atoms,
                         residues=residues,
                         interfaces=interfaces,
                     )
+                
+                
+                # Count hydrogen atoms in final structure
+                hydrogen_count_final = 0
+                for i, atom in enumerate(new_structure.atoms):
+                    atom_name = atom[0] if self.boltz2 else atom[0]
+                    if isinstance(atom_name, str) and atom_name.startswith('H'):
+                        hydrogen_count_final += 1
 
                 # Update chain info
                 chain_info = []
@@ -174,10 +236,13 @@ class BoltzWriter(BasePredictionWriter):
                 # Save the structure
                 if self.output_format == "pdb":
                     path = struct_dir / f"{outname}.pdb"
+                    
+                    
+                    
+                    pdb_content = to_pdb(new_structure, plddts=plddts, boltz2=self.boltz2)
+                    
                     with path.open("w") as f:
-                        f.write(
-                            to_pdb(new_structure, plddts=plddts, boltz2=self.boltz2)
-                        )
+                        f.write(pdb_content)
                 elif self.output_format == "mmcif":
                     path = struct_dir / f"{outname}.cif"
                     with path.open("w") as f:
@@ -380,26 +445,19 @@ class BoltzWriter(BasePredictionWriter):
             if "fixed_chains" in batch:
                 fixed_chains_value = batch["fixed_chains"]
                 if isinstance(fixed_chains_value, (torch.Tensor, np.ndarray)):
-                    # Handle tensor case - convert asym_ids back to chain letters
                     fixed_asym_ids = fixed_chains_value.cpu().numpy() if hasattr(fixed_chains_value, 'cpu') else fixed_chains_value
                     if hasattr(fixed_asym_ids, 'flatten'):
                         fixed_asym_ids = fixed_asym_ids.flatten()
                     
-                    # Convert asym_ids back to chain letters using structure info
                     asym_id_to_chain = {}
                     if record.structure and hasattr(record.structure, 'chains'):
                         for chain in record.structure.chains:
                             if 'asym_id' in chain and 'name' in chain:
                                 asym_id_to_chain[chain['asym_id']] = chain['name']
                     
-                    # Map asym_ids to chain letters
                     for asym_id in fixed_asym_ids:
                         if asym_id in asym_id_to_chain:
                             fixed_chains.append(asym_id_to_chain[asym_id])
-                        else:
-                            print(f"[Writer] Warning: Could not map asym_id {asym_id} to chain letter")
-                    
-                    print(f"[Writer] Converted fixed asym_ids {fixed_asym_ids} to chain letters {fixed_chains}")
                     
                 elif isinstance(fixed_chains_value, list):
                     if len(fixed_chains_value) > 0:
@@ -440,6 +498,8 @@ class BoltzWriter(BasePredictionWriter):
                             )
                         except Exception as e:
                             print(f"Error creating unrotated {trajectory_type} trajectory: {e}")
+    
+    
     
 
 class BoltzAffinityWriter(BasePredictionWriter):

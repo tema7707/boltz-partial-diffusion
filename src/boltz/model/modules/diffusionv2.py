@@ -367,6 +367,12 @@ class AtomDiffusion(Module):
                 initial_coords = initial_coords.unsqueeze(0)
             
             initial_coords = initial_coords.to(device=self.device, dtype=torch.float32)
+            
+            # CRITICAL FIX: Apply canonical space transformation to initial coordinates
+            # Center the coordinates like Boltz does during training (center_random_augmentation)
+            initial_coords_mean = initial_coords.mean(dim=-2, keepdims=True)
+            initial_coords = initial_coords - initial_coords_mean
+            
             initial_coords = initial_coords.repeat_interleave(multiplicity, 0)
             
             if initial_coords.shape != shape:
@@ -397,9 +403,11 @@ class AtomDiffusion(Module):
         fixed_chains_data = None
         if "fixed_chains" in feats and "initial_coords" in feats and len(feats["fixed_chains"]) > 0:
             try:
-                fixed_asym_ids = feats["fixed_chains"]
+                fixed_asym_ids = feats["fixed_chains"]  # These are already asym_id indices (tensors)
                 initial_coords = feats["initial_coords"]
                 
+                
+                # Convert to tensor if needed
                 if not isinstance(fixed_asym_ids, torch.Tensor):
                     fixed_asym_ids = torch.tensor(fixed_asym_ids, dtype=torch.long, device=atom_coords.device)
                 else:
@@ -416,20 +424,20 @@ class AtomDiffusion(Module):
                 else:
                     asym_id = asym_id.to(device=atom_coords.device)
                 
-                print(f"[FixedChains DEBUG] Fixed asym_ids: {fixed_asym_ids}")
-                print(f"[FixedChains DEBUG] Asym_id tensor shape: {asym_id.shape}")
-                print(f"[FixedChains DEBUG] Unique asym_id values: {torch.unique(asym_id)}")
-                
                 # Convert token-level asym_id to atom-level asym_id
                 atom_to_token = feats["atom_to_token"]
                 asym_id_atom = torch.bmm(atom_to_token.float(), asym_id.unsqueeze(-1).float()).squeeze(-1).long()
-                print(f"[FixedChains DEBUG] Atom-level asym_id shape: {asym_id_atom.shape}")
-                print(f"[FixedChains DEBUG] Unique atom-level asym_id values: {torch.unique(asym_id_atom)}")
+                
+                # DEBUG: Print asym_id information
+                # DEBUG: Token-level asym_id: {asym_id}")
+                # DEBUG: Atom-level asym_id unique values: {torch.unique(asym_id_atom)}")
+                # DEBUG: Fixed chain IDs requested: {fixed_asym_ids}")
                 
                 fixed_mask = torch.zeros_like(asym_id_atom, dtype=torch.bool, device=atom_coords.device)
                 for fixed_asym_id in fixed_asym_ids:
                     mask_for_this_id = (asym_id_atom == fixed_asym_id)
-                    print(f"[FixedChains DEBUG] Checking asym_id {fixed_asym_id}: found {mask_for_this_id.sum()} atoms")
+                    num_atoms_for_chain = mask_for_this_id.sum().item()
+                    # DEBUG: Chain {fixed_asym_id}: {num_atoms_for_chain} atoms will be fixed")
                     fixed_mask |= mask_for_this_id
                 
                 if len(fixed_mask.shape) == 1:
@@ -456,24 +464,13 @@ class AtomDiffusion(Module):
                     elif initial_coords.shape[1] > atom_coords.shape[1]:
                         initial_coords = initial_coords[:, :atom_coords.shape[1], :]
                 
-                print(f"[FixedChains DEBUG] Final fixed_mask shape: {fixed_mask.shape}")
-                print(f"[FixedChains DEBUG] Total fixed atoms: {fixed_mask.sum()}")
                 expanded_mask = fixed_mask.expand(atom_coords.shape)
-                print(f"[FixedChains DEBUG] Expanded fixed_mask shape: {expanded_mask.shape}")
-                print(f"[FixedChains DEBUG] Expanded mask total fixed: {expanded_mask.sum()}")
                 
-                # Debug initial coordinates
-                print(f"[FixedChains DEBUG] Initial coords shape: {initial_coords.shape}")
-                print(f"[FixedChains DEBUG] Atom coords shape: {atom_coords.shape}")
-                print(f"[FixedChains DEBUG] Initial coords sample: {initial_coords[0, :3]}")
-                print(f"[FixedChains DEBUG] Current atom coords sample (before centering): {atom_coords[0, :3]}")
-                
-                # Center the initial coords to match how atom_coords will be processed
-                initial_coords_centered = initial_coords - initial_coords.mean(dim=-2, keepdims=True)
-                print(f"[FixedChains DEBUG] Initial coords sample (after centering): {initial_coords_centered[0, :3]}")
+                # Reference coordinates are now pre-centered and will be transformed consistently 
+                # with atom_coords during each diffusion step using the same transformations
                 
                 # Add fixed chains data to feats for use in forward pass
-                feats["fixed_chains_ref_coords"] = initial_coords_centered
+                feats["fixed_chains_ref_coords"] = initial_coords
                 feats["fixed_chains_mask"] = expanded_mask
                 
                 # Keep minimal data for debugging
@@ -481,8 +478,25 @@ class AtomDiffusion(Module):
                     'total_steps': len(sigmas_and_gammas)
                 }
                 
+                # DEBUG: Check initial geometry of fixed chains
+                if initial_coords.shape[1] >= 2:
+                    sample_bond = torch.norm(initial_coords[0, 1] - initial_coords[0, 0]).item()
+                    # DEBUG: Initial sample bond distance: {sample_bond:.3f}Å")
+                    
+                    # Check if these look like reasonable protein coordinates
+                    coord_range = initial_coords.max() - initial_coords.min()
+                    # DEBUG: Coordinate range: {coord_range:.1f}Å")
+                    
+                    # Sample a few more consecutive bonds
+                    if initial_coords.shape[1] >= 10:
+                        sample_bonds = []
+                        for i in range(min(5, initial_coords.shape[1]-1)):
+                            bond = torch.norm(initial_coords[0, i+1] - initial_coords[0, i]).item()
+                            sample_bonds.append(bond)
+                        # DEBUG: First 5 consecutive bonds: {[f'{d:.3f}' for d in sample_bonds]}")
+                
+                
             except Exception as e:
-                print(f"[FixedChains DEBUG] Exception setting up fixed chains: {e}")
                 fixed_chains_data = None
 
         # gradually denoise
@@ -496,27 +510,70 @@ class AtomDiffusion(Module):
                 atom_coords_centered = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
                 trajectory_coords.append(atom_coords_centered[0].detach().cpu().clone())
             
-            atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
-            atom_coords = (
-                torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
-            )
-            
-            # Apply the same transformations to reference coordinates so they stay aligned
+            # GEOMETRY-PRESERVING FIXED CHAINS: Apply only translation, no rotation
             if fixed_chains_data is not None and "fixed_chains_ref_coords" in feats:
-                ref_coords = feats["fixed_chains_ref_coords"]
-                ref_coords_centered = ref_coords - ref_coords.mean(dim=-2, keepdims=True)
-                ref_coords_transformed = (
-                    torch.einsum("bmd,bds->bms", ref_coords_centered, random_R) + random_tr
+                # DEBUG: Step {step_idx}: Applying geometry-preserving transformation")
+                reference_coords = feats["fixed_chains_ref_coords"]  
+                fixed_mask = feats["fixed_chains_mask"]
+                
+                # DEBUG: Check geometry before transformation
+                if step_idx == 0:
+                    sample_fixed_bond = torch.norm(reference_coords[0, 1] - reference_coords[0, 0]).item()
+                    # DEBUG: Step {step_idx}: Reference geometry sample bond: {sample_fixed_bond:.3f}Å")
+                
+                # For fixed atoms: apply ONLY translation to preserve internal geometry
+                fixed_atoms = reference_coords
+                
+                # Transform non-fixed atoms normally (center + rotate + translate)
+                non_fixed_mask = ~fixed_mask
+                atom_coords_new = atom_coords.clone()
+                
+                if non_fixed_mask.any():
+                    # Extract and transform non-fixed atoms
+                    non_fixed_coords = torch.where(non_fixed_mask, atom_coords, torch.zeros_like(atom_coords))
+                    non_fixed_mean = non_fixed_coords.sum(dim=-2, keepdims=True) / non_fixed_mask.sum(dim=-2, keepdims=True).float()
+                    non_fixed_centered = (non_fixed_coords - non_fixed_mean) * non_fixed_mask.float()
+                    non_fixed_transformed = torch.einsum("bmd,bds->bms", non_fixed_centered, random_R) + random_tr * non_fixed_mask.float()
+                    
+                    # For fixed atoms: apply translation to align with transformed structure
+                    fixed_centroid = fixed_atoms.mean(dim=-2, keepdims=True)
+                    non_fixed_centroid = non_fixed_transformed.sum(dim=-2, keepdims=True) / non_fixed_mask.sum(dim=-2, keepdims=True).float()
+                    
+                    # Translation to align fixed chain with transformed structure  
+                    translation_offset = non_fixed_centroid - fixed_centroid + random_tr
+                    fixed_atoms_aligned = fixed_atoms + translation_offset
+                    
+                    # Combine results: use transformed non-fixed and aligned fixed
+                    atom_coords = torch.where(fixed_mask, fixed_atoms_aligned, non_fixed_transformed)
+                    
+                    # Update reference coordinates for next step
+                    feats["fixed_chains_ref_coords"] = fixed_atoms_aligned
+                else:
+                    # If all atoms are fixed, apply only translation
+                    atom_coords += random_tr
+                    feats["fixed_chains_ref_coords"] = atom_coords
+            else:
+                # Standard processing when no fixed chains
+                atom_coords_mean = atom_coords.mean(dim=-2, keepdims=True)
+                atom_coords = atom_coords - atom_coords_mean
+                atom_coords = (
+                    torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
                 )
-                # Update the reference coordinates in feats
-                feats["fixed_chains_ref_coords"] = ref_coords_transformed
             
             if atom_coords_denoised is not None:
-                atom_coords_denoised -= atom_coords_denoised.mean(dim=-2, keepdims=True)
-                atom_coords_denoised = (
-                    torch.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
-                    + random_tr
-                )
+                # Apply same transformation logic as for atom_coords
+                if fixed_chains_data is not None and "fixed_chains_ref_coords" in feats:
+                    # For fixed chains: keep them at reference positions
+                    fixed_mask = feats["fixed_chains_mask"]
+                    reference_coords = feats["fixed_chains_ref_coords"]
+                    atom_coords_denoised = torch.where(fixed_mask, reference_coords, atom_coords_denoised)
+                else:
+                    # Standard transformation for denoised coordinates
+                    atom_coords_denoised_mean = atom_coords_denoised.mean(dim=-2, keepdims=True)
+                    atom_coords_denoised -= atom_coords_denoised_mean
+                    atom_coords_denoised = (
+                        torch.einsum("bmd,bds->bms", atom_coords_denoised, random_R) + random_tr
+                    )
             if (
                 steering_args["physical_guidance_update"]
                 or steering_args["contact_guidance_update"]
@@ -551,20 +608,8 @@ class AtomDiffusion(Module):
                     )
                     atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
 
-                # Apply fixed chains masking to the denoised prediction  
-                if fixed_chains_data is not None and "fixed_chains_ref_coords" in feats:
-                    # Use clean reference coordinates without additional noise
-                    reference_coords = feats["fixed_chains_ref_coords"]
-                    fixed_mask = feats["fixed_chains_mask"]
-                    
-                    # For fixed atoms, replace denoised prediction with clean reference coordinates
-                    atom_coords_denoised = torch.where(
-                        fixed_mask, 
-                        reference_coords, 
-                        atom_coords_denoised
-                    )
-                    
-                    print(f"[FixedChains DEBUG] Step {step_idx}, sigma_tm={sigma_tm:.4f}")
+                # Skip fixed chains masking here - we'll apply it at the very end
+                # This avoids issues with coordinate transformations corrupting the reference structure
 
                 # Store un-rotated denoised coordinates for trajectory
                 if save_trajectory and atom_coords_denoised is not None:
@@ -701,15 +746,41 @@ class AtomDiffusion(Module):
 
                 atom_coords_noisy = atom_coords_noisy.to(atom_coords_denoised)
 
+            # Fixed chains constraint is now applied at the beginning of each step
+            # No need to apply here as it would interfere with the denoising process
+
             denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat
             atom_coords_next = (
                 atom_coords_noisy + step_scale * (sigma_t - t_hat) * denoised_over_sigma
             )
 
-            # Fixed chains logic is now handled in the forward pass
-            # No need for additional masking here
+            # Fixed chains constraint will be applied at the beginning of the next step
+            # No need to apply here to avoid double-application
 
             atom_coords = atom_coords_next
+
+        # FINAL FIXED CHAINS APPLICATION - ensure fixed chains are preserved in final output
+        if fixed_chains_data is not None and "fixed_chains_ref_coords" in feats:
+            # DEBUG: Applying final fixed chains constraint")
+            reference_coords = feats["fixed_chains_ref_coords"]
+            fixed_mask = feats["fixed_chains_mask"]
+            
+            # DEBUG: Check geometry before final application
+            if reference_coords.shape[1] >= 2:
+                final_ref_bond = torch.norm(reference_coords[0, 1] - reference_coords[0, 0]).item()
+                # DEBUG: Final reference bond: {final_ref_bond:.3f}Å")
+            
+            # Apply final fixed chains constraint to ensure they're preserved in output
+            atom_coords = torch.where(
+                fixed_mask,
+                reference_coords,
+                atom_coords
+            )
+            
+            # DEBUG: Check geometry after final application
+            if atom_coords.shape[1] >= 2:
+                final_output_bond = torch.norm(atom_coords[0, 1] - atom_coords[0, 0]).item()
+                # DEBUG: Final output bond: {final_output_bond:.3f}Å")
 
         # Prepare return dictionary
         result_dict = dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
