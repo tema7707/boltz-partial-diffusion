@@ -121,25 +121,41 @@ class ConfidenceModule(nn.Module):
         if run_sequentially and multiplicity > 1:
             assert z.shape[0] == 1, "Not supported with batch size > 1"
             out_dicts = []
+            device = x_pred.device  # Remember original device
             for sample_idx in range(multiplicity):
-                out_dicts.append(  # noqa: PERF401
-                    self.forward(
-                        s_inputs,
-                        s,
-                        z,
-                        x_pred[sample_idx : sample_idx + 1],
-                        feats,
-                        pred_distogram_logits,
-                        multiplicity=1,
-                        run_sequentially=False,
-                        use_kernels=use_kernels,
-                    )
+                sample_out = self.forward(
+                    s_inputs,
+                    s,
+                    z,
+                    x_pred[sample_idx : sample_idx + 1],
+                    feats,
+                    pred_distogram_logits,
+                    multiplicity=1,
+                    run_sequentially=False,
+                    use_kernels=use_kernels,
                 )
+                # Move results to CPU immediately to free GPU memory
+                cpu_out = {}
+                for key in sample_out:
+                    if key != "pair_chains_iptm":
+                        cpu_out[key] = sample_out[key].cpu()
+                    else:
+                        # Handle nested dict for pair_chains_iptm
+                        cpu_out[key] = {}
+                        for chain_idx1 in sample_out[key]:
+                            cpu_out[key][chain_idx1] = {}
+                            for chain_idx2 in sample_out[key][chain_idx1]:
+                                cpu_out[key][chain_idx1][chain_idx2] = sample_out[key][chain_idx1][chain_idx2].cpu()
+                out_dicts.append(cpu_out)
+                # Clear GPU cache to free memory
+                del sample_out
+                torch.cuda.empty_cache()
 
+            # Concatenate on CPU, then move back to GPU
             out_dict = {}
             for key in out_dicts[0]:
                 if key != "pair_chains_iptm":
-                    out_dict[key] = torch.cat([out[key] for out in out_dicts], dim=0)
+                    out_dict[key] = torch.cat([out[key] for out in out_dicts], dim=0).to(device)
                 else:
                     pair_chains_iptm = {}
                     for chain_idx1 in out_dicts[0][key]:
@@ -148,7 +164,7 @@ class ConfidenceModule(nn.Module):
                             chains_iptm[chain_idx2] = torch.cat(
                                 [out[key][chain_idx1][chain_idx2] for out in out_dicts],
                                 dim=0,
-                            )
+                            ).to(device)
                         pair_chains_iptm[chain_idx1] = chains_iptm
                     out_dict[key] = pair_chains_iptm
             return out_dict
