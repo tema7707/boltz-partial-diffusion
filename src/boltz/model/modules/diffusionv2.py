@@ -327,12 +327,40 @@ class AtomDiffusion(Module):
             max_parallel_samples = multiplicity
 
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
+        
+        # Extract partial diffusion configuration
+        feats = network_condition_kwargs.get("feats", {})
+        partial_diffusion_fraction = feats.get("partial_diffusion_fraction", 0.0)
+        if hasattr(partial_diffusion_fraction, 'item'):
+            partial_diffusion_fraction = partial_diffusion_fraction.item()
+        
+        # Calculate step range for partial diffusion
+        # Partial diffusion allows starting from an intermediate point in the denoising process
+        # Example: fraction=0.25 means run only the final 25% of denoising steps
+        original_num_steps = num_sampling_steps
+        partial_diffusion_skip_steps = 0
+        
+        if partial_diffusion_fraction > 0.0 and "initial_coords" in feats:
+            # Calculate how many steps to skip based on the fraction
+            partial_diffusion_skip_steps = int(original_num_steps * (1.0 - partial_diffusion_fraction))
+            actual_steps = original_num_steps - partial_diffusion_skip_steps
+            actual_steps = max(1, actual_steps)  # Ensure at least 1 step
+            
+            # Update sampling steps for partial diffusion
+            num_sampling_steps = actual_steps
+        
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
 
         shape = (*atom_mask.shape, 3)
 
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
-        sigmas = self.sample_schedule(num_sampling_steps)
+        if partial_diffusion_skip_steps > 0:
+            # For partial diffusion, generate the full schedule and slice the relevant portion
+            full_sigmas = self.sample_schedule(original_num_steps)
+            # Take the final portion of the schedule (skip the first part)
+            sigmas = full_sigmas[partial_diffusion_skip_steps:partial_diffusion_skip_steps + num_sampling_steps + 1]
+        else:
+            sigmas = self.sample_schedule(num_sampling_steps)
         gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0)
         sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
         if self.training and self.step_scale_random is not None:
@@ -340,17 +368,134 @@ class AtomDiffusion(Module):
         else:
             step_scale = self.step_scale
 
-        # atom position is noise at the beginning
+        # Check if trajectory saving is enabled
+        save_trajectory = network_condition_kwargs.get("feats", {}).get("save_trajectory", False)
+        trajectory_decoded_only = network_condition_kwargs.get("feats", {}).get("trajectory_decoded_only", False)
+        
+        # Initialize trajectory storage
+        trajectory_coords = []
+        trajectory_denoised = []
+
+        # atom position initialization - support partial diffusion
         init_sigma = sigmas[0]
-        atom_coords = init_sigma * torch.randn(shape, device=self.device)
+        
+        # Check if initial coordinates are provided for partial diffusion
+        feats = network_condition_kwargs.get("feats", {})
+        if "initial_coords" in feats and feats["initial_coords"] is not None:
+            initial_coords = feats["initial_coords"]
+            
+            # Ensure correct shape and device
+            if len(initial_coords.shape) == 2:  # (num_atoms, 3)
+                initial_coords = initial_coords.unsqueeze(0)  # (1, num_atoms, 3)
+            
+            initial_coords = initial_coords.to(device=self.device, dtype=torch.float32)
+            
+            # Repeat for multiplicity (multiple samples)
+            initial_coords = initial_coords.repeat_interleave(multiplicity, 0)
+            
+            # Handle shape mismatch by padding or truncating if needed
+            if initial_coords.shape != shape:
+                expected_atoms = shape[1]  # shape is (batch, atoms, 3)
+                actual_atoms = initial_coords.shape[-2]
+                
+                if actual_atoms < expected_atoms:
+                    # Pad with zeros
+                    padding_needed = expected_atoms - actual_atoms
+                    padding = torch.zeros((initial_coords.shape[0], padding_needed, 3), 
+                                        device=initial_coords.device, dtype=initial_coords.dtype)
+                    initial_coords = torch.cat([initial_coords, padding], dim=1)
+                elif actual_atoms > expected_atoms:
+                    # Truncate to expected size
+                    initial_coords = initial_coords[:, :expected_atoms, :]
+            
+            # For partial diffusion, start with noise level corresponding to the starting sigma
+            if partial_diffusion_fraction > 0.0:
+                # Use the actual sigma from the schedule where we're starting
+                starting_sigma = init_sigma  # This is now the correct sigma from the sliced schedule
+                
+                noise = torch.randn_like(initial_coords)
+                atom_coords = initial_coords + starting_sigma * noise
+            else:
+                # Very light noise for stability  
+                noise = torch.randn_like(initial_coords)
+                atom_coords = initial_coords + 0.01 * init_sigma * noise
+                
+        else:
+            # Original behavior: start from pure noise
+            atom_coords = init_sigma * torch.randn(shape, device=self.device)
         token_repr = None
         atom_coords_denoised = None
+
+        fixed_chains_data = None
+        if "fixed_chains" in feats and "initial_coords" in feats and len(feats["fixed_chains"]) > 0:
+            try:
+                fixed_asym_ids = feats["fixed_chains"]
+                initial_coords = feats["initial_coords"]
+                
+                if not isinstance(fixed_asym_ids, torch.Tensor):
+                    fixed_asym_ids = torch.tensor(fixed_asym_ids, dtype=torch.long, device=atom_coords.device)
+                else:
+                    fixed_asym_ids = fixed_asym_ids.to(device=atom_coords.device)
+                
+                if not isinstance(initial_coords, torch.Tensor):
+                    initial_coords = torch.tensor(initial_coords, dtype=atom_coords.dtype, device=atom_coords.device)
+                else:
+                    initial_coords = initial_coords.to(device=atom_coords.device, dtype=atom_coords.dtype)
+                
+                asym_id = feats["asym_id"]
+                if not isinstance(asym_id, torch.Tensor):
+                    asym_id = torch.tensor(asym_id, dtype=torch.long, device=atom_coords.device)
+                else:
+                    asym_id = asym_id.to(device=atom_coords.device)
+                
+                fixed_mask = torch.zeros_like(asym_id, dtype=torch.bool, device=atom_coords.device)
+                for fixed_asym_id in fixed_asym_ids:
+                    fixed_mask |= (asym_id == fixed_asym_id)
+                
+                if len(fixed_mask.shape) == 1:
+                    fixed_mask = fixed_mask.unsqueeze(0).unsqueeze(-1)
+                elif len(fixed_mask.shape) == 2:
+                    fixed_mask = fixed_mask.unsqueeze(-1)
+                
+                if len(initial_coords.shape) == 2:
+                    initial_coords = initial_coords.unsqueeze(0)
+                
+                if initial_coords.shape[0] != atom_coords.shape[0]:
+                    initial_coords = initial_coords.repeat(atom_coords.shape[0], 1, 1)
+                
+                if initial_coords.shape != atom_coords.shape:
+                    if initial_coords.shape[1] < atom_coords.shape[1]:
+                        padding_needed = atom_coords.shape[1] - initial_coords.shape[1]
+                        if initial_coords.shape[1] > 0:
+                            last_coord = initial_coords[:, -1:, :].expand(-1, padding_needed, -1)
+                            initial_coords = torch.cat([initial_coords, last_coord], dim=1)
+                        else:
+                            padding = torch.zeros((initial_coords.shape[0], padding_needed, 3), 
+                                                device=initial_coords.device, dtype=initial_coords.dtype)
+                            initial_coords = torch.cat([initial_coords, padding], dim=1)
+                    elif initial_coords.shape[1] > atom_coords.shape[1]:
+                        initial_coords = initial_coords[:, :atom_coords.shape[1], :]
+                
+                fixed_chains_data = {
+                    'fixed_mask': fixed_mask.expand(atom_coords.shape),
+                    'initial_coords': initial_coords,
+                    'total_steps': len(sigmas_and_gammas)
+                }
+                
+            except Exception:
+                fixed_chains_data = None
 
         # gradually denoise
         for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
             random_R, random_tr = compute_random_augmentation(
                 multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
             )
+            
+            # Store un-rotated coordinates for trajectory (before random augmentation)
+            if save_trajectory:
+                atom_coords_centered = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
+                trajectory_coords.append(atom_coords_centered[0].detach().cpu().clone())
+            
             atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
             atom_coords = (
                 torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
@@ -380,9 +525,12 @@ class AtomDiffusion(Module):
             with torch.no_grad():
                 atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
                 sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
-                sample_ids_chunks = sample_ids.chunk(
-                    multiplicity % max_parallel_samples + 1
-                )
+                # Compute correct number of chunks to avoid OOM when multiplicity is large
+                # Old buggy logic: multiplicity % max_parallel_samples + 1
+                # e.g., 25 % 5 + 1 = 1 (wrong - would run all 25 samples at once)
+                # Correct: ceil(multiplicity / max_parallel_samples)
+                num_chunks = (multiplicity + max_parallel_samples - 1) // max_parallel_samples
+                sample_ids_chunks = sample_ids.chunk(num_chunks)
 
                 for sample_ids_chunk in sample_ids_chunks:
                     atom_coords_denoised_chunk = self.preconditioned_network_forward(
@@ -394,6 +542,16 @@ class AtomDiffusion(Module):
                         ),
                     )
                     atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+
+                # Store un-rotated denoised coordinates for trajectory
+                if save_trajectory and atom_coords_denoised is not None:
+                    # Apply inverse transformation to remove random augmentation
+                    inverse_R = random_R.transpose(-1, -2)  # Transpose for inverse rotation
+                    atom_coords_denoised_unrotated = torch.einsum("bmd,bsd->bms", 
+                                                                 atom_coords_denoised - random_tr, inverse_R)
+                    # Center the un-rotated coordinates  
+                    atom_coords_denoised_centered = atom_coords_denoised_unrotated - atom_coords_denoised_unrotated.mean(dim=-2, keepdims=True)
+                    trajectory_denoised.append(atom_coords_denoised_centered[0].detach().cpu().clone())
 
                 if steering_args["fk_steering"] and (
                     (
@@ -525,9 +683,28 @@ class AtomDiffusion(Module):
                 atom_coords_noisy + step_scale * (sigma_t - t_hat) * denoised_over_sigma
             )
 
+            if fixed_chains_data is not None:
+                progress = step_idx / fixed_chains_data['total_steps']
+                reference_strength = min(0.7, progress * 0.5)
+                blended_coords = (1.0 - reference_strength) * atom_coords_next + reference_strength * fixed_chains_data['initial_coords']
+                atom_coords_next = torch.where(fixed_chains_data['fixed_mask'], blended_coords, atom_coords_next)
+
             atom_coords = atom_coords_next
 
-        return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
+        # Prepare return dictionary
+        result_dict = dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
+        
+        # Add trajectory data if trajectory saving was enabled
+        if save_trajectory:
+            if trajectory_coords:
+                result_dict["trajectory_coords"] = trajectory_coords
+            if trajectory_denoised and not trajectory_decoded_only:
+                result_dict["trajectory_denoised"] = trajectory_denoised
+            elif trajectory_denoised and trajectory_decoded_only:
+                # Only include denoised trajectory when decoded_only is requested
+                result_dict["trajectory_denoised"] = trajectory_denoised
+                
+        return result_dict
 
     def loss_weight(self, sigma):
         return (sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data) ** 2)

@@ -1,0 +1,15 @@
+version: 1
+sequences:
+- protein:
+    id: A
+    sequence: KPTNVGEIVKKILEVKEKLPEDITDEEIIEILSKDPNIIPDLLPRIIPNIDEIKEIAYKALGIKP
+    msa: ./folded_binder.a3m
+- protein:
+    id: B
+    sequence: KVCQGTSNKLTQLGTFEDHFLSLQRMFNNCEVVLGNLEITYVQRNYDLSFLKTIQEVAGYVLIALNTVERIPLENLQIIRGNMYYENSYALAVLSNYDANKTGLKELPMRNLQEILHGAVRFSNNPALCNVESIQWRDIVSSDFLSNMSMDFQNHLGS
+    msa: ./1mox_EGFR_Nside.a3m
+templates:
+- cif: ./folded_binder.cif
+  chain_id: A
+- cif: ./1mox_EGFR_Nside.cif
+  chain_id: B

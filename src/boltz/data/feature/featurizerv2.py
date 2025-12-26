@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 from typing import Optional
 from collections import deque
 import numba
@@ -2309,7 +2310,7 @@ class Boltz2Featurizer:
 
         # Compute template features
         num_tokens = data.tokens.shape[0] if max_tokens is None else max_tokens
-        if data.templates:
+        if data.templates and not compute_affinity:
             template_features = process_template_features(
                 data=data,
                 max_tokens=num_tokens,
@@ -2339,7 +2340,7 @@ class Boltz2Featurizer:
                 inference_contact_constraints=inference_contact_constraints if inference_contact_constraints else [],
             )
 
-        return {
+        features = {
             **token_features,
             **atom_features,
             **msa_features,
@@ -2352,3 +2353,61 @@ class Boltz2Featurizer:
             **contact_constraint_features,
             **ligand_to_mw,
         }
+        
+        # Check for trajectory saving configuration and fixed chains
+        initial_coords_file = Path.cwd() / "initial_coords.pt"
+        if initial_coords_file.exists():
+            coords_data = torch.load(initial_coords_file)
+            if isinstance(coords_data, dict):
+                # Extract configuration
+                save_trajectory = coords_data.get('save_trajectory', False)
+                fixed_chains = coords_data.get('fixed_chains', [])
+                
+                if save_trajectory:
+                    features["save_trajectory"] = save_trajectory
+                    
+                if fixed_chains:
+                    chain_name_to_asym_id = {}
+                    for asym_id, chain_data in data.structure.chains.items():
+                        chain_name = chain_data.get("name", str(asym_id))
+                        chain_name_to_asym_id[chain_name] = asym_id
+                    
+                    fixed_asym_ids = []
+                    invalid_chains = []
+                    
+                    for chain_letter in fixed_chains:
+                        if not isinstance(chain_letter, str):
+                            invalid_chains.append(chain_letter)
+                            continue
+                            
+                        if chain_letter in chain_name_to_asym_id:
+                            fixed_asym_ids.append(chain_name_to_asym_id[chain_letter])
+                        else:
+                            found_match = False
+                            for chain_name, asym_id in chain_name_to_asym_id.items():
+                                if chain_name.upper() == chain_letter.upper():
+                                    fixed_asym_ids.append(asym_id)
+                                    found_match = True
+                                    break
+                            if not found_match:
+                                invalid_chains.append(chain_letter)
+                    
+                    if invalid_chains:
+                        available_chains = sorted(chain_name_to_asym_id.keys())
+                        if not fixed_asym_ids:
+                            raise ValueError(f"Invalid fixed chains {invalid_chains}. Available: {available_chains}")
+                    
+                    if fixed_asym_ids:
+                        unique_fixed_asym_ids = list(dict.fromkeys(fixed_asym_ids))
+                        features["fixed_chains"] = torch.tensor(unique_fixed_asym_ids, dtype=torch.long)
+                    else:
+                        features["fixed_chains"] = torch.tensor([], dtype=torch.long)
+                    
+                # Load initial coordinates and partial diffusion settings
+                initial_coords = coords_data.get('coords')
+                if initial_coords is not None:
+                    features["initial_coords"] = initial_coords
+                    partial_diffusion_fraction = coords_data.get('partial_diffusion_fraction', 0.0)
+                    features["partial_diffusion_fraction"] = torch.tensor(partial_diffusion_fraction, dtype=torch.float32)
+
+        return features

@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from functools import partial
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 import click
 import torch
@@ -1039,6 +1039,29 @@ def cli() -> None:
     is_flag=True,
     help=" to dump the s and z embeddings into a npz file. Default is False.",
 )
+@click.option(
+    "--partial_diffusion_pdb",
+    type=click.Path(exists=True),
+    help="Path to PDB file containing initial structure for partial diffusion (will extract coordinates automatically).",
+    default=None,
+)
+@click.option(
+    "--partial_diffusion_fraction",
+    type=float,
+    help="Fraction of diffusion steps to run (0.0-1.0): 0.1 = 10% of steps, 0.5 = 50% of steps, 1.0 = 100% of steps (full diffusion). Default is 0.1.",
+    default=0.1,
+)
+@click.option(
+    "--save_trajectory",
+    is_flag=True,
+    help="Save diffusion trajectory coordinates for each step (for visualization). Creates trajectory files in output directory.",
+)
+@click.option(
+    "--fixed_chains",
+    type=str,
+    multiple=True,
+    help="Chain IDs to keep fixed during diffusion (e.g., --fixed_chains A --fixed_chains B). These chains will be kept at their input structure positions with noise applied to sync with the diffusion schedule.",
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1077,6 +1100,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
     write_embeddings: bool = False,
+    partial_diffusion_pdb: Optional[str] = None,
+    partial_diffusion_fraction: float = 0.1,
+    save_trajectory: bool = False,
+    fixed_chains: tuple[str, ...] = (),
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1236,6 +1263,87 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         step_scale = 1.638 if step_scale is None else step_scale
         diffusion_params.step_scale = step_scale
         pairformer_args = PairformerArgs()
+
+    # Handle partial diffusion parameters
+    if partial_diffusion_pdb is not None:
+        # Validate partial_diffusion_fraction
+        if not 0.0 < partial_diffusion_fraction <= 1.0:
+            msg = f"partial_diffusion_fraction must be between 0.0 and 1.0, got {partial_diffusion_fraction}"
+            raise ValueError(msg)
+            
+        def extract_coordinates_from_pdb(pdb_path: str) -> Optional[torch.Tensor]:
+            """Extract coordinates from PDB file.
+            
+            Parameters
+            ----------
+            pdb_path : str
+                Path to PDB file
+                
+            Returns
+            -------
+            Optional[torch.Tensor]
+                Coordinates tensor or None if extraction fails
+            """
+            try:
+                coords = []
+                with open(pdb_path, 'r') as f:
+                    for line in f:
+                        if line.startswith('ATOM') or (line.startswith('HETATM') and line[17:20].strip() != 'HOH'):
+                            x = float(line[30:38].strip())
+                            y = float(line[38:46].strip()) 
+                            z = float(line[46:54].strip())
+                            coords.append([x, y, z])
+                
+                if not coords:
+                    return None
+                
+                coords_tensor = torch.tensor(coords, dtype=torch.float32)
+                
+                # Apply padding to next multiple of window size for GPU efficiency
+                atoms_per_window = const.ATOMS_PER_WINDOW_QUERIES if hasattr(const, 'ATOMS_PER_WINDOW_QUERIES') else 32
+                current_atoms = len(coords)
+                expected_atoms = ((current_atoms - 1) // atoms_per_window + 1) * atoms_per_window
+                
+                if current_atoms < expected_atoms:
+                    padding_size = expected_atoms - current_atoms
+                    padding = torch.zeros(padding_size, 3, dtype=torch.float32)
+                    coords_tensor = torch.cat([coords_tensor, padding], dim=0)
+                
+                return coords_tensor
+                
+            except Exception as e:
+                click.echo(f"Failed to extract coordinates from PDB: {e}")
+                return None
+
+        coords_array = extract_coordinates_from_pdb(partial_diffusion_pdb)
+        if coords_array is not None:
+            click.echo(f"Loaded initial coordinates with shape: {coords_array.shape}")
+            
+            coord_data = {
+                'coords': coords_array,
+                'partial_diffusion_fraction': partial_diffusion_fraction,
+                'save_trajectory': save_trajectory,
+                'fixed_chains': list(fixed_chains)
+            }
+            
+            torch.save(coord_data, 'initial_coords.pt')
+            click.echo("Saved coordinate data for featurizer")
+
+    # Handle fixed chains without partial diffusion
+    elif fixed_chains:
+        # Validate fixed chains are single characters (chain IDs)
+        for chain in fixed_chains:
+            if not (isinstance(chain, str) and len(chain) == 1):
+                msg = f"Invalid chain ID '{chain}'. Chain IDs must be single characters (e.g., 'A', 'B')"
+                raise ValueError(msg)
+                
+        click.echo(f"Fixed chains specified: {list(fixed_chains)}")
+        coord_data = {
+            'fixed_chains': list(fixed_chains),
+            'save_trajectory': save_trajectory
+        }
+        torch.save(coord_data, 'initial_coords.pt')
+        click.echo("Saved fixed chains configuration for featurizer")
 
     msa_args = MSAModuleArgs(
         subsample_msa=subsample_msa,
