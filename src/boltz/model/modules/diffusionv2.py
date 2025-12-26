@@ -525,9 +525,12 @@ class AtomDiffusion(Module):
             with torch.no_grad():
                 atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
                 sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
-                sample_ids_chunks = sample_ids.chunk(
-                    multiplicity % max_parallel_samples + 1
-                )
+                # Compute correct number of chunks to avoid OOM when multiplicity is large
+                # Old buggy logic: multiplicity % max_parallel_samples + 1
+                # e.g., 25 % 5 + 1 = 1 (wrong - would run all 25 samples at once)
+                # Correct: ceil(multiplicity / max_parallel_samples)
+                num_chunks = (multiplicity + max_parallel_samples - 1) // max_parallel_samples
+                sample_ids_chunks = sample_ids.chunk(num_chunks)
 
                 for sample_ids_chunk in sample_ids_chunks:
                     atom_coords_denoised_chunk = self.preconditioned_network_forward(
